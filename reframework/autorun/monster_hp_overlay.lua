@@ -7,8 +7,7 @@ local CONFIG_PATH = "monster_hp_overlay.json"
 
 local DEFAULT_CONFIG = {
 	enabled = true,
-	show_all = true,
-	show_ailments = true,
+	show_all = false,
 	x = 600,
 	y = 12,
 	font_size = 20,
@@ -133,10 +132,6 @@ local function as_number(value)
 end
 
 local function read_ailments(enemy_context)
-	if not config.show_ailments then
-		return {}
-	end
-
 	if
 		enemy_context_conditions == nil
 		or conditions_module_conditions == nil
@@ -489,10 +484,6 @@ local function draw_fixed_percent(draw_list, x, y, color, ratio)
 end
 
 local function draw_ailments(draw_list, x, y, ailments)
-	if not config.show_ailments then
-		return 0
-	end
-
 	local ailments_by_order = {}
 	for _, ailment in ipairs(ailments or {}) do
 		ailments_by_order[ailment.order] = ailment
@@ -628,24 +619,32 @@ re.on_draw_ui(function()
 	if imgui.tree_node(MOD_NAME) then
 		value_changed, config.enabled = imgui.checkbox("Enabled", config.enabled)
 		changed = changed or value_changed
-		value_changed, config.show_all = imgui.checkbox("Show all large monsters", config.show_all)
+		value_changed, config.show_all = imgui.checkbox("Show all", config.show_all)
 		changed = changed or value_changed
-		value_changed, config.show_ailments = imgui.checkbox("Show ailments", config.show_ailments)
+		value_changed, config.x = imgui.slider_int("X", config.x, 0, 1920)
 		changed = changed or value_changed
-		value_changed, config.x = imgui.slider_int("X", config.x, 0, 4000)
+		value_changed, config.y = imgui.slider_int("Y", config.y, 0, 1080)
 		changed = changed or value_changed
-		value_changed, config.y = imgui.slider_int("Y", config.y, 0, 4000)
+		value_changed, config.font_size = imgui.slider_int("Font size", config.font_size, 10, 40)
 		changed = changed or value_changed
-		value_changed, config.font_size = imgui.slider_int("Font size", config.font_size, 16, 64)
+		value_changed, config.bar_width = imgui.slider_int("Bar width", config.bar_width, 160, 640)
 		changed = changed or value_changed
-		value_changed, config.bar_width = imgui.slider_int("Bar width", config.bar_width, 120, 1000)
+		value_changed, config.bar_height = imgui.slider_int("Bar height", config.bar_height, 6, 24)
 		changed = changed or value_changed
-		value_changed, config.bar_height = imgui.slider_int("Bar height", config.bar_height, 8, 48)
+		value_changed, config.row_spacing = imgui.slider_int("Row spacing", config.row_spacing, 6, 24)
 		changed = changed or value_changed
-		value_changed, config.row_spacing = imgui.slider_int("Row spacing", config.row_spacing, 0, 64)
+		value_changed, config.column_spacing = imgui.slider_int("Column spacing", config.column_spacing, 6, 24)
 		changed = changed or value_changed
-		value_changed, config.column_spacing = imgui.slider_int("Column spacing", config.column_spacing, 0, 128)
-		changed = changed or value_changed
+		if imgui.button("Reset values") then
+			config.x = DEFAULT_CONFIG.x
+			config.y = DEFAULT_CONFIG.y
+			config.font_size = DEFAULT_CONFIG.font_size
+			config.bar_width = DEFAULT_CONFIG.bar_width
+			config.bar_height = DEFAULT_CONFIG.bar_height
+			config.row_spacing = DEFAULT_CONFIG.row_spacing
+			config.column_spacing = DEFAULT_CONFIG.column_spacing
+			changed = true
+		end
 		imgui.separator()
 		imgui.text("Update callbacks: " .. tostring(diagnostics.update_calls))
 		imgui.text("Large monster candidates: " .. tostring(diagnostics.boss_candidates))
@@ -656,7 +655,7 @@ re.on_draw_ui(function()
 		end
 
 		if changed then
-			config.font_size = math.max(16, config.font_size)
+			config.font_size = math.max(10, config.font_size)
 		end
 
 		imgui.tree_pop()
