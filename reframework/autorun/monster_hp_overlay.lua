@@ -8,6 +8,7 @@ local CONFIG_PATH = "monster_hp_overlay.json"
 local DEFAULT_CONFIG = {
 	enabled = true,
 	show_all = false,
+	show_ailments = true,
 	x = 600,
 	y = 12,
 	font_size = 16,
@@ -21,16 +22,36 @@ local monsters = {}
 local diagnostics = {
 	update_calls = 0,
 	boss_candidates = 0,
+	ailment_count = 0,
 	last_error = nil,
 }
 local diagnostic_frame = 0
 local quest_target_keys = {}
+
+local AILMENT_DEFINITIONS = {
+	[3] = { name = "毒", order = 2, color = 0xFFF755A8, background_color = 0xAA54243D },
+	[5] = { name = "麻痺", order = 1, color = 0xFF00D9FF, background_color = 0xAA105560 },
+	[7] = { name = "睡眠", order = 3, color = 0xFFE1CF56, background_color = 0xAA4D4630 },
+	[9] = { name = "爆破", order = 4, color = 0xFF428CFF, background_color = 0xAA1E3754 },
+}
 
 local quest_util_type = sdk.find_type_definition("app.QuestUtil")
 local get_active_quest_target_bosses = quest_util_type and quest_util_type:get_method("getActiveQuestTargetBossList()")
 local target_access_key_util_type = sdk.find_type_definition("app.TargetAccessKeyUtil")
 local get_enemy_character = target_access_key_util_type
 	and target_access_key_util_type:get_method("getEnemyCharacter(app.TARGET_ACCESS_KEY, System.Boolean)")
+local enemy_context_type = sdk.find_type_definition("app.cEnemyContext")
+local enemy_context_conditions = enemy_context_type and enemy_context_type:get_field("Conditions")
+local conditions_module_type = sdk.find_type_definition("app.cEmModuleConditions")
+local conditions_module_conditions = conditions_module_type and conditions_module_type:get_field("_Conditions")
+local bad_condition_type = sdk.find_type_definition("app.cEnemyBadCondition")
+local bad_condition_condition_type = bad_condition_type and bad_condition_type:get_field("_ConditionType")
+local activate_value_type = sdk.find_type_definition("app.cEnemyActivateValueBase")
+local activate_value_is_active = activate_value_type and activate_value_type:get_method("get_IsActive()")
+local activate_value_get_value = activate_value_type and activate_value_type:get_method("get_Value()")
+local activate_value_get_limit = activate_value_type and activate_value_type:get_method("get_LimitValue()")
+local activate_value_get_activate_time = activate_value_type and activate_value_type:get_method("get_ActivateTime()")
+local activate_value_get_current_timer = activate_value_type and activate_value_type:get_method("get_CurrentTimer()")
 
 local function copy_defaults()
 	local result = {}
@@ -103,6 +124,87 @@ local function as_number(value)
 	end
 
 	return nil
+end
+
+local function read_ailments(enemy_context)
+	if not config.show_ailments then
+		return {}
+	end
+
+	if
+		enemy_context_conditions == nil
+		or conditions_module_conditions == nil
+		or bad_condition_condition_type == nil
+		or activate_value_is_active == nil
+		or activate_value_get_value == nil
+		or activate_value_get_limit == nil
+		or activate_value_get_activate_time == nil
+		or activate_value_get_current_timer == nil
+	then
+		diagnostics.last_error = "Ailment type definitions not found"
+		return {}
+	end
+
+	local conditions_module = enemy_context_conditions:get_data(enemy_context)
+	if conditions_module == nil then
+		diagnostics.last_error = "Enemy Conditions module not found"
+		return {}
+	end
+
+	local conditions = conditions_module_conditions:get_data(conditions_module)
+	if conditions == nil then
+		diagnostics.last_error = "Enemy Conditions array not found"
+		return {}
+	end
+
+	local count = conditions:get_Count()
+	diagnostics.ailment_count = count or 0
+
+	local ailments = {}
+	for index = 0, count - 1 do
+		local condition = conditions:get_Item(index)
+		if condition ~= nil and condition:get_type_definition():is_a("app.cEnemyBadCondition") then
+			local condition_type = bad_condition_condition_type:get_data(condition)
+			local definition = AILMENT_DEFINITIONS[condition_type]
+			if definition ~= nil then
+				local is_active = activate_value_is_active:call(condition) == true
+				local buildup = activate_value_get_value:call(condition) or 0
+				local max_buildup = activate_value_get_limit:call(condition) or 0
+				local remaining = 0
+				if is_active then
+					local active_time = activate_value_get_activate_time:call(condition) or 0
+					local current_timer = activate_value_get_current_timer:call(condition) or 0
+					remaining = math.max(0, active_time - current_timer)
+				end
+
+				table.insert(ailments, {
+					name = definition.name,
+					order = definition.order,
+					color = definition.color,
+					buildup = math.max(0, buildup),
+					max_buildup = math.max(0, max_buildup),
+					is_active = is_active,
+					remaining = remaining,
+				})
+			end
+		end
+	end
+
+	table.sort(ailments, function(left, right)
+		return left.order < right.order
+	end)
+
+	return ailments
+end
+
+local function try_read_ailments(enemy_context)
+	local ok, ailments = pcall(read_ailments, enemy_context)
+	if not ok then
+		diagnostics.last_error = "Ailment read failed: " .. tostring(ailments)
+		return {}
+	end
+
+	return ailments
 end
 
 local function get_enemy_key(enemy)
@@ -241,6 +343,7 @@ local function read_monster(enemy)
 		health = math.max(0, health),
 		max_health = max_health,
 		ratio = math.max(0, math.min(1, health / max_health)),
+		ailments = try_read_ailments(em),
 	}
 end
 
@@ -312,13 +415,43 @@ local function draw_fixed_percent(draw_list, x, y, color, ratio)
 
 	draw_outlined_text(draw_list, x + digit_width * 3, y, color, ".")
 	draw_outlined_text(draw_list, x + digit_width * 3 + decimal_width, y, color, text:sub(5, 5))
-	draw_outlined_text(
-		draw_list,
-		x + digit_width * 3 + decimal_width + digit_width,
-		y,
-		color,
-		"%"
-	)
+	draw_outlined_text(draw_list, x + digit_width * 3 + decimal_width + digit_width, y, color, "%")
+end
+
+local function draw_ailments(draw_list, x, y, ailments)
+	if not config.show_ailments then
+		return 0
+	end
+
+	local ailments_by_order = {}
+	for _, ailment in ipairs(ailments or {}) do
+		ailments_by_order[ailment.order] = ailment
+	end
+
+	local bar_height = math.max(4, math.floor(config.bar_height / 2))
+	local bar_spacing = 3
+	local column_width = (config.bar_width - bar_spacing) / 2
+	local border_color = 0xFF000000
+	for order, id in ipairs({ 5, 3, 7, 9 }) do
+		local definition = AILMENT_DEFINITIONS[id]
+		local ailment = ailments_by_order[order]
+		local ratio = 0
+		if ailment ~= nil and ailment.max_buildup > 0 then
+			ratio = math.max(0, math.min(1, ailment.buildup / ailment.max_buildup))
+		end
+
+		local column = (order - 1) % 2
+		local row = math.floor((order - 1) / 2)
+		local bar_x = x + column * (column_width + bar_spacing)
+		local bar_y = y + row * (bar_height + bar_spacing)
+		local right = bar_x + column_width
+		local bottom = bar_y + bar_height
+		draw_list:add_rect_filled({ bar_x, bar_y }, { right, bottom }, definition.background_color, 0, 0)
+		draw_list:add_rect_filled({ bar_x, bar_y }, { bar_x + column_width * ratio, bottom }, definition.color, 0, 0)
+		draw_list:add_rect({ bar_x, bar_y }, { right, bottom }, border_color, 0, 0, 1)
+	end
+
+	return 2 * bar_height + bar_spacing
 end
 
 local function get_monster_rows()
@@ -371,7 +504,9 @@ local function draw_overlay()
 		draw_outlined_text(draw_list, max_x, y, 0xFFE8E8E8, max_text)
 		draw_fixed_percent(draw_list, percent_x, y, 0xFFE8E8E8, monster.ratio)
 		draw_bar(draw_list, config.x, y + config.font_size + 4, monster.ratio)
-		y = y + config.font_size + 4 + config.bar_height + config.row_spacing
+		local ailment_height =
+			draw_ailments(draw_list, config.x, y + config.font_size + 4 + config.bar_height + 4, monster.ailments)
+		y = y + config.font_size + 4 + config.bar_height + ailment_height + config.row_spacing
 	end
 
 	imgui.pop_font_size()
@@ -385,6 +520,8 @@ re.on_draw_ui(function()
 		value_changed, config.enabled = imgui.checkbox("Enabled", config.enabled)
 		changed = changed or value_changed
 		value_changed, config.show_all = imgui.checkbox("Show all large monsters", config.show_all)
+		changed = changed or value_changed
+		value_changed, config.show_ailments = imgui.checkbox("Show ailments", config.show_ailments)
 		changed = changed or value_changed
 		value_changed, config.x = imgui.slider_int("X", config.x, 0, 4000)
 		changed = changed or value_changed
@@ -402,6 +539,7 @@ re.on_draw_ui(function()
 		imgui.text("Update callbacks: " .. tostring(diagnostics.update_calls))
 		imgui.text("Large monster candidates: " .. tostring(diagnostics.boss_candidates))
 		imgui.text("Tracked monsters: " .. tostring(#get_monster_rows()))
+		imgui.text("Ailment entries: " .. tostring(diagnostics.ailment_count))
 		if diagnostics.last_error ~= nil then
 			imgui.text("Last error: " .. diagnostics.last_error)
 		end
