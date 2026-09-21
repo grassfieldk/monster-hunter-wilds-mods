@@ -7,7 +7,7 @@ local CONFIG_PATH = "monster_hp_overlay.json"
 
 local DEFAULT_CONFIG = {
 	enabled = true,
-	show_all = false,
+	show_all = true,
 	show_ailments = true,
 	x = 600,
 	y = 12,
@@ -15,6 +15,7 @@ local DEFAULT_CONFIG = {
 	bar_width = 320,
 	bar_height = 12,
 	row_spacing = 12,
+	column_spacing = 12,
 }
 
 local config = {}
@@ -170,9 +171,10 @@ local function read_ailments(enemy_context)
 				local is_active = activate_value_is_active:call(condition) == true
 				local buildup = activate_value_get_value:call(condition) or 0
 				local max_buildup = activate_value_get_limit:call(condition) or 0
+				local active_time = 0
 				local remaining = 0
 				if is_active then
-					local active_time = activate_value_get_activate_time:call(condition) or 0
+					active_time = activate_value_get_activate_time:call(condition) or 0
 					local current_timer = activate_value_get_current_timer:call(condition) or 0
 					remaining = math.max(0, active_time - current_timer)
 				end
@@ -184,6 +186,7 @@ local function read_ailments(enemy_context)
 					buildup = math.max(0, buildup),
 					max_buildup = math.max(0, max_buildup),
 					is_active = is_active,
+					active_time = math.max(0, active_time),
 					remaining = remaining,
 				})
 			end
@@ -347,10 +350,40 @@ local function read_monster(enemy)
 	}
 end
 
+local function draw_filled_capsule(draw_list, x, y, width, height, color)
+	local radius = height / 2
+	local center_y = y + radius
+	if width <= height then
+		draw_list:add_circle_filled({ x + width / 2, center_y }, width / 2, color, 16)
+		return
+	end
+
+	draw_list:add_rect_filled({ x + radius, y }, { x + width - radius, y + height }, color, 0, 0)
+	draw_list:add_circle_filled({ x + radius, center_y }, radius, color, 16)
+	draw_list:add_circle_filled({ x + width - radius, center_y }, radius, color, 16)
+end
+
+local function draw_capsule_outline(draw_list, x, y, width, height, color)
+	draw_list:add_rect({ x, y }, { x + width, y + height }, color, height / 2, 0, 1)
+end
+
+local function draw_capsule_bar(draw_list, x, y, width, height, ratio, background_color, fill_color, show_border)
+	local border_color = 0x88000000
+	draw_filled_capsule(draw_list, x, y, width, height, background_color)
+
+	local fill_width = width * math.max(0, math.min(1, ratio))
+	if fill_width > 0 then
+		draw_filled_capsule(draw_list, x, y, fill_width, height, fill_color)
+	end
+
+	if show_border ~= false then
+		draw_capsule_outline(draw_list, x, y, width, height, border_color)
+	end
+end
+
 local function draw_bar(draw_list, x, y, ratio)
 	local background_color = 0xAA222222
-	local border_color = 0xFF000000
-	local threshold_color = 0xFF000000
+	local threshold_color = 0x88000000
 	local fill_color = 0xFF38B764
 
 	if ratio <= 0.25 then
@@ -359,19 +392,16 @@ local function draw_bar(draw_list, x, y, ratio)
 		fill_color = 0xFF32A8E0
 	end
 
-	local right = x + config.bar_width
+	draw_capsule_bar(draw_list, x, y, config.bar_width, config.bar_height, ratio, background_color, fill_color)
 	local bottom = y + config.bar_height
-	draw_list:add_rect_filled({ x, y }, { right, bottom }, background_color, 0, 0)
-	draw_list:add_rect_filled({ x, y }, { x + config.bar_width * ratio, bottom }, fill_color, 0, 0)
 	for _, threshold in ipairs({ 0.25, 0.5 }) do
 		local marker_x = x + config.bar_width * threshold
 		draw_list:add_rect_filled({ marker_x, y + 1 }, { marker_x + 1, bottom - 1 }, threshold_color, 0, 0)
 	end
-	draw_list:add_rect({ x, y }, { right, bottom }, border_color, 0, 0, 1)
 end
 
 local function draw_outlined_text(draw_list, x, y, color, text)
-	local outline_color = 0xFF000000
+	local outline_color = 0x88000000
 	for offset_y = -1, 1 do
 		for offset_x = -1, 1 do
 			if offset_x ~= 0 or offset_y ~= 0 then
@@ -428,15 +458,16 @@ local function draw_ailments(draw_list, x, y, ailments)
 		ailments_by_order[ailment.order] = ailment
 	end
 
-	local bar_height = math.max(4, math.floor(config.bar_height / 2))
+	local bar_height = math.max(8, math.floor(config.bar_height * 2 / 3))
 	local bar_spacing = 3
 	local column_width = (config.bar_width - bar_spacing) / 2
-	local border_color = 0xFF000000
 	for order, id in ipairs({ 5, 3, 7, 9 }) do
 		local definition = AILMENT_DEFINITIONS[id]
 		local ailment = ailments_by_order[order]
 		local ratio = 0
-		if ailment ~= nil and ailment.max_buildup > 0 then
+		if ailment ~= nil and ailment.is_active and ailment.active_time > 0 then
+			ratio = math.max(0, math.min(1, ailment.remaining / ailment.active_time))
+		elseif ailment ~= nil and ailment.max_buildup > 0 then
 			ratio = math.max(0, math.min(1, ailment.buildup / ailment.max_buildup))
 		end
 
@@ -444,11 +475,16 @@ local function draw_ailments(draw_list, x, y, ailments)
 		local row = math.floor((order - 1) / 2)
 		local bar_x = x + column * (column_width + bar_spacing)
 		local bar_y = y + row * (bar_height + bar_spacing)
-		local right = bar_x + column_width
-		local bottom = bar_y + bar_height
-		draw_list:add_rect_filled({ bar_x, bar_y }, { right, bottom }, definition.background_color, 0, 0)
-		draw_list:add_rect_filled({ bar_x, bar_y }, { bar_x + column_width * ratio, bottom }, definition.color, 0, 0)
-		draw_list:add_rect({ bar_x, bar_y }, { right, bottom }, border_color, 0, 0, 1)
+		draw_capsule_bar(
+			draw_list,
+			bar_x,
+			bar_y,
+			column_width,
+			bar_height,
+			ratio,
+			definition.background_color,
+			definition.color
+		)
 	end
 
 	return 2 * bar_height + bar_spacing
@@ -480,9 +516,13 @@ local function draw_overlay()
 
 	imgui.push_font_size(config.font_size)
 
-	local y = config.y
-	for _, monster in ipairs(rows) do
-		local text_x = config.x
+	local row_y = config.y
+	local row_height = 0
+	for index, monster in ipairs(rows) do
+		local column = (index - 1) % 2
+		local x = config.x + column * (config.bar_width + config.column_spacing)
+		local y = row_y
+		local text_x = x
 		local hp_x = text_x + config.font_size * 9
 		local current_text = string.format("%5.0f", monster.health)
 		local max_text = string.format("%5.0f", monster.max_health)
@@ -503,10 +543,16 @@ local function draw_overlay()
 		draw_outlined_text(draw_list, slash_x, y, 0xFFE8E8E8, "/")
 		draw_outlined_text(draw_list, max_x, y, 0xFFE8E8E8, max_text)
 		draw_fixed_percent(draw_list, percent_x, y, 0xFFE8E8E8, monster.ratio)
-		draw_bar(draw_list, config.x, y + config.font_size + 4, monster.ratio)
+		draw_bar(draw_list, x, y + config.font_size + 4, monster.ratio)
 		local ailment_height =
-			draw_ailments(draw_list, config.x, y + config.font_size + 4 + config.bar_height + 4, monster.ailments)
-		y = y + config.font_size + 4 + config.bar_height + ailment_height + config.row_spacing
+			draw_ailments(draw_list, x, y + config.font_size + 4 + config.bar_height + 4, monster.ailments)
+		local monster_height = config.font_size + 4 + config.bar_height + 4 + ailment_height
+		row_height = math.max(row_height, monster_height)
+
+		if column == 1 or index == #rows then
+			row_y = row_y + row_height + config.row_spacing
+			row_height = 0
+		end
 	end
 
 	imgui.pop_font_size()
@@ -534,6 +580,8 @@ re.on_draw_ui(function()
 		value_changed, config.bar_height = imgui.slider_int("Bar height", config.bar_height, 8, 48)
 		changed = changed or value_changed
 		value_changed, config.row_spacing = imgui.slider_int("Row spacing", config.row_spacing, 0, 64)
+		changed = changed or value_changed
+		value_changed, config.column_spacing = imgui.slider_int("Column spacing", config.column_spacing, 0, 128)
 		changed = changed or value_changed
 		imgui.separator()
 		imgui.text("Update callbacks: " .. tostring(diagnostics.update_calls))
