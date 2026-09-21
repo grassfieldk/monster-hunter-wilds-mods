@@ -11,7 +11,7 @@ local DEFAULT_CONFIG = {
 	show_ailments = true,
 	x = 600,
 	y = 12,
-	font_size = 16,
+	font_size = 20,
 	bar_width = 320,
 	bar_height = 12,
 	row_spacing = 12,
@@ -20,6 +20,7 @@ local DEFAULT_CONFIG = {
 
 local config = {}
 local monsters = {}
+local font_cache = {}
 local diagnostics = {
 	update_calls = 0,
 	boss_candidates = 0,
@@ -43,8 +44,12 @@ local get_enemy_character = target_access_key_util_type
 	and target_access_key_util_type:get_method("getEnemyCharacter(app.TARGET_ACCESS_KEY, System.Boolean)")
 local enemy_context_type = sdk.find_type_definition("app.cEnemyContext")
 local enemy_context_conditions = enemy_context_type and enemy_context_type:get_field("Conditions")
+local enemy_context_dying = enemy_context_type and enemy_context_type:get_field("Dying")
 local conditions_module_type = sdk.find_type_definition("app.cEmModuleConditions")
 local conditions_module_conditions = conditions_module_type and conditions_module_type:get_field("_Conditions")
+local dying_module_type = sdk.find_type_definition("app.cEmModuleDying")
+local dying_is_enable_capture = dying_module_type and dying_module_type:get_method("get_IsEnableCapture()")
+local dying_get_capture_vital_rate = dying_module_type and dying_module_type:get_method("get_CaptureVitalRate()")
 local bad_condition_type = sdk.find_type_definition("app.cEnemyBadCondition")
 local bad_condition_condition_type = bad_condition_type and bad_condition_type:get_field("_ConditionType")
 local activate_value_type = sdk.find_type_definition("app.cEnemyActivateValueBase")
@@ -210,6 +215,29 @@ local function try_read_ailments(enemy_context)
 	return ailments
 end
 
+local function read_enemy_dying(enemy_context)
+	if enemy_context_dying == nil then
+		return false, nil
+	end
+
+	local ok, is_weakened, capture_rate = pcall(function()
+		local dying = enemy_context_dying:get_data(enemy_context)
+		if dying == nil then
+			return false, nil
+		end
+
+		local weakened = dying_is_enable_capture ~= nil and dying_is_enable_capture:call(dying) == true
+		local rate = dying_get_capture_vital_rate ~= nil and as_number(dying_get_capture_vital_rate:call(dying)) or nil
+		return weakened, rate
+	end)
+
+	if not ok then
+		return false, nil
+	end
+
+	return is_weakened == true, capture_rate
+end
+
 local function get_enemy_key(enemy)
 	local ok, address = pcall(function()
 		return enemy:get_address()
@@ -334,18 +362,25 @@ local function read_monster(enemy)
 	if health == nil or max_health == nil or max_health <= 0 then
 		return nil
 	end
+	local is_finished = health <= 0
+		or try_call(browser, "get_IsCapture") == true
+		or try_call(browser, "get_IsDie") == true
 
 	local ids = {
 		id = read_member(basic, "EmID"),
 		role_id = read_member(basic, "RoleID"),
 		legendary_id = read_member(basic, "LegendaryID"),
 	}
+	local is_weakened, capture_rate = read_enemy_dying(em)
 
 	return {
 		name = get_enemy_name(ids),
 		health = math.max(0, health),
 		max_health = max_health,
 		ratio = math.max(0, math.min(1, health / max_health)),
+		is_weakened = is_weakened,
+		capture_rate = capture_rate,
+		is_finished = is_finished,
 		ailments = try_read_ailments(em),
 	}
 end
@@ -381,22 +416,27 @@ local function draw_capsule_bar(draw_list, x, y, width, height, ratio, backgroun
 	end
 end
 
-local function draw_bar(draw_list, x, y, ratio)
+local function draw_bar(draw_list, x, y, ratio, is_weakened, capture_rate)
 	local background_color = 0xAA222222
-	local threshold_color = 0x88000000
-	local fill_color = 0xFF38B764
+	local green_color = 0xFF38B764
+	local yellow_color = 0xFF32A8E0
+	local red_color = 0xFF3C55D9
+	local fill_color = green_color
 
-	if ratio <= 0.25 then
-		fill_color = 0xFF3C55D9
+	if is_weakened then
+		fill_color = red_color
 	elseif ratio <= 0.5 then
-		fill_color = 0xFF32A8E0
+		fill_color = yellow_color
 	end
 
 	draw_capsule_bar(draw_list, x, y, config.bar_width, config.bar_height, ratio, background_color, fill_color)
 	local bottom = y + config.bar_height
-	for _, threshold in ipairs({ 0.25, 0.5 }) do
-		local marker_x = x + config.bar_width * threshold
-		draw_list:add_rect_filled({ marker_x, y + 1 }, { marker_x + 1, bottom - 1 }, threshold_color, 0, 0)
+	local half_marker_x = x + config.bar_width * 0.5
+	draw_list:add_rect_filled({ half_marker_x, y + 1 }, { half_marker_x + 1, bottom - 1 }, yellow_color, 0, 0)
+
+	if capture_rate ~= nil and capture_rate >= 0 and capture_rate <= 1 then
+		local weakened_marker_x = x + config.bar_width * capture_rate
+		draw_list:add_rect_filled({ weakened_marker_x, y + 1 }, { weakened_marker_x + 1, bottom - 1 }, red_color, 0, 0)
 	end
 end
 
@@ -503,6 +543,18 @@ local function get_monster_rows()
 	return rows
 end
 
+local function get_japanese_font(size)
+	if font_cache[size] == nil then
+		local ok, font = pcall(imgui.load_font, "NotoSansJP-Medium.otf", size)
+		font_cache[size] = ok and font or false
+		if not ok then
+			diagnostics.last_error = "Japanese font load failed: " .. tostring(font)
+		end
+	end
+
+	return font_cache[size] or nil
+end
+
 local function draw_overlay()
 	local rows = get_monster_rows()
 	if not config.enabled or #rows == 0 then
@@ -514,7 +566,12 @@ local function draw_overlay()
 		return
 	end
 
-	imgui.push_font_size(config.font_size)
+	local font = get_japanese_font(config.font_size)
+	if font ~= nil then
+		imgui.push_font(font)
+	else
+		imgui.push_font_size(config.font_size)
+	end
 
 	local row_y = config.y
 	local row_height = 0
@@ -523,7 +580,6 @@ local function draw_overlay()
 		local x = config.x + column * (config.bar_width + config.column_spacing)
 		local y = row_y
 		local text_x = x
-		local hp_x = text_x + config.font_size * 9
 		local current_text = string.format("%5.0f", monster.health)
 		local max_text = string.format("%5.0f", monster.max_health)
 		local percent_width = get_fixed_percent_width()
@@ -536,14 +592,17 @@ local function draw_overlay()
 		local slash_x = max_x - spacing - slash_width
 		local current_right = slash_x - spacing
 		local current_x = current_right - get_text_width(current_text)
+		local hp_x = current_x - spacing - get_text_width("HP")
+		local name_color = monster.is_finished and 0x88999999 or 0xFFFFFFFF
+		local value_color = monster.is_finished and 0x88999999 or 0xFFE8E8E8
 
-		draw_outlined_text(draw_list, text_x, y, 0xFFFFFFFF, monster.name)
-		draw_outlined_text(draw_list, hp_x, y, 0xFFE8E8E8, "HP")
-		draw_outlined_text(draw_list, current_x, y, 0xFFE8E8E8, current_text)
-		draw_outlined_text(draw_list, slash_x, y, 0xFFE8E8E8, "/")
-		draw_outlined_text(draw_list, max_x, y, 0xFFE8E8E8, max_text)
-		draw_fixed_percent(draw_list, percent_x, y, 0xFFE8E8E8, monster.ratio)
-		draw_bar(draw_list, x, y + config.font_size + 4, monster.ratio)
+		draw_outlined_text(draw_list, text_x, y, name_color, monster.name)
+		draw_outlined_text(draw_list, hp_x, y, value_color, "HP")
+		draw_outlined_text(draw_list, current_x, y, value_color, current_text)
+		draw_outlined_text(draw_list, slash_x, y, value_color, "/")
+		draw_outlined_text(draw_list, max_x, y, value_color, max_text)
+		draw_fixed_percent(draw_list, percent_x, y, value_color, monster.ratio)
+		draw_bar(draw_list, x, y + config.font_size + 4, monster.ratio, monster.is_weakened, monster.capture_rate)
 		local ailment_height =
 			draw_ailments(draw_list, x, y + config.font_size + 4 + config.bar_height + 4, monster.ailments)
 		local monster_height = config.font_size + 4 + config.bar_height + 4 + ailment_height
@@ -555,7 +614,11 @@ local function draw_overlay()
 		end
 	end
 
-	imgui.pop_font_size()
+	if font ~= nil then
+		imgui.pop_font()
+	else
+		imgui.pop_font_size()
+	end
 end
 
 re.on_draw_ui(function()
