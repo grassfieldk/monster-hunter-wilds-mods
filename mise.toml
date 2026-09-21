@@ -1,0 +1,17 @@
+[tools]
+"aqua:JohnnyMorganz/StyLua" = "2.5.2"
+
+[env]
+_.file = ".env"
+
+[tasks.check]
+description = "Validate the Lua script syntax with the project-local StyLua runtime"
+run = "stylua --check reframework/autorun/monster_hp_overlay.lua"
+
+[tasks.deploy]
+description = "Copy the mod into the REFramework autorun directory from .env"
+run = "pwsh -NoProfile -ExecutionPolicy Bypass -File tools/deploy.ps1"
+
+[tasks.deploy-wsl]
+description = "Copy the mod into the REFramework autorun directory from WSL"
+run = "bash tools/deploy.sh"

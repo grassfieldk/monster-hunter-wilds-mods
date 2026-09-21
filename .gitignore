@@ -1,0 +1,26 @@
+# Local environment and machine-specific configuration
+.env
+.env.*
+!.env.example
+.mise.local.toml
+
+# mise and local tooling caches
+.mise/
+.cache/
+
+# Generated REFramework data and logs
+reframework/data/
+reframework/logs/
+*.log
+
+# Local deployment and editor files
+.deploy/
+.vscode/*.local.json
+
+# Windows and temporary files
+*.user
+*.suo
+*.tmp
+*.temp
+Thumbs.db
+Desktop.ini
