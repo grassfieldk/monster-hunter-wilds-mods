@@ -3,6 +3,7 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source_file="$repo_root/reframework/autorun/monster_hp_overlay.lua"
+source_image_dir="$repo_root/reframework/images/monster_hp_overlay"
 source_font="/mnt/c/Windows/Fonts/NotoSansJP-Medium.otf"
 
 to_wsl_path() {
@@ -25,9 +26,15 @@ else
 fi
 
 target_font_dir="$(dirname "$target_dir")/fonts"
+target_image_dir="$(dirname "$target_dir")/images/monster_hp_overlay"
 
 if [[ ! -f "$source_file" ]]; then
 	echo "Source file was not found: $source_file" >&2
+	exit 1
+fi
+
+if [[ ! -d "$source_image_dir" ]]; thenｎ
+	echo "Image directory was not found: $source_image_dir" >&2
 	exit 1
 fi
 
@@ -37,8 +44,11 @@ if [[ ! -f "$source_font" ]]; then
 fi
 
 mkdir -p "$target_dir"
+mkdir -p "$target_image_dir"
 mkdir -p "$target_font_dir"
 cp "$source_file" "$target_dir/monster_hp_overlay.lua"
+cp -R -n "$source_image_dir/." "$target_image_dir/"
 cp "$source_font" "$target_font_dir/NotoSansJP-Medium.otf"
 printf 'Deployed monster_hp_overlay.lua to %s\n' "$target_dir"
+printf 'Deployed monster_hp_overlay images to %s\n' "$target_image_dir"
 printf 'Deployed NotoSansJP-Medium.otf to %s\n' "$target_font_dir"

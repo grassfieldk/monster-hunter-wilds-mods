@@ -4,6 +4,15 @@ end
 
 local MOD_NAME = "Monster HP Overlay"
 local CONFIG_PATH = "monster_hp_overlay.json"
+local ENEMY_ICON_PATH = "monster_hp_overlay/enemy"
+local ELEMENT_ICON_PATH = "monster_hp_overlay/icons"
+local ENEMY_ICON_PADDING = 5
+local ENEMY_ICON_BAR_SPACING = 8
+local ENEMY_ICON_BORDER_WIDTH = 2
+local ELEMENT_WEAKNESS_THRESHOLD = 20
+local ENEMY_ICON_BACKGROUND_COLOR = 0xFF2D2819
+local ENEMY_ICON_BORDER_COLOR = 0xFFB8B8A8
+local ENEMY_ICON_CORNER_RADIUS = 4
 
 local DEFAULT_CONFIG = {
 	enabled = true,
@@ -15,11 +24,18 @@ local DEFAULT_CONFIG = {
 	bar_height = 12,
 	row_spacing = 12,
 	column_spacing = 12,
+	weakness_icon_size = 16,
+	weakness_icon_spacing = 12,
+	weakness_icon_dim_alpha = 0.4,
 }
 
 local config = {}
 local monsters = {}
 local font_cache = {}
+local enemy_icon_cache = {}
+local enemy_icon_unknown = nil
+local element_icons = {}
+local elemental_weakness_cache = {}
 local diagnostics = {
 	update_calls = 0,
 	boss_candidates = 0,
@@ -29,11 +45,37 @@ local diagnostics = {
 local diagnostic_frame = 0
 local quest_target_keys = {}
 
+local function get_enum_map(type_name)
+	local result = {}
+	local type_definition = sdk.find_type_definition(type_name)
+	if type_definition == nil then
+		return result
+	end
+
+	for _, field in ipairs(type_definition:get_fields()) do
+		if field:is_static() then
+			result[field:get_data(nil)] = field:get_name()
+		end
+	end
+
+	return result
+end
+
+local enemy_id_names = get_enum_map("app.EnemyDef.ID")
+
 local AILMENT_DEFINITIONS = {
 	[3] = { name = "毒", order = 2, color = 0xFFF755A8, background_color = 0xAA54243D },
 	[5] = { name = "麻痺", order = 1, color = 0xFF00D9FF, background_color = 0xAA105560 },
 	[7] = { name = "睡眠", order = 3, color = 0xFFE1CF56, background_color = 0xAA4D4630 },
 	[9] = { name = "爆破", order = 4, color = 0xFF428CFF, background_color = 0xAA1E3754 },
+}
+
+local ELEMENT_DEFINITIONS = {
+	{ type = "Fire", field = "_Fire", icon = "fire.png" },
+	{ type = "Water", field = "_Water", icon = "water.png" },
+	{ type = "Thunder", field = "_Thunder", icon = "thunder.png" },
+	{ type = "Ice", field = "_Ice", icon = "ice.png" },
+	{ type = "Dragon", field = "_Dragon", icon = "dragon.png" },
 }
 
 local quest_util_type = sdk.find_type_definition("app.QuestUtil")
@@ -233,6 +275,70 @@ local function read_enemy_dying(enemy_context)
 	return is_weakened == true, capture_rate
 end
 
+local function read_elemental_weaknesses(enemy_context, em_id)
+	if elemental_weakness_cache[em_id] ~= nil then
+		return elemental_weakness_cache[em_id]
+	end
+
+	local parts_module = read_member(enemy_context, "Parts")
+	local parameters = read_member(parts_module, "_ParamParts")
+	local parts_array = read_member(read_member(parameters, "_PartsArray"), "_DataArray")
+	local meat_array = read_member(read_member(parameters, "_MeatArray"), "_DataArray")
+	if parameters == nil or parts_array == nil or meat_array == nil then
+		return {}
+	end
+
+	local part_count = try_call(parts_array, "get_Count") or 0
+	local meat_count = try_call(meat_array, "get_Count") or 0
+	local maximums = {}
+	for _, definition in ipairs(ELEMENT_DEFINITIONS) do
+		maximums[definition.type] = 0
+	end
+
+	for index = 0, part_count - 1 do
+		local part = try_call(parts_array, "get_Item", index)
+		local meat = index < meat_count and try_call(meat_array, "get_Item", index) or nil
+		local meat_guid = read_member(part, "_MeatGuidNormal")
+		local nullable_meat_index = try_call(parameters, "getMeatIndex(System.Guid)", meat_guid)
+		local has_meat_index = read_member(nullable_meat_index, "_HasValue") == true
+		local meat_index = has_meat_index and read_member(nullable_meat_index, "_Value") or nil
+		if meat_index ~= nil and meat_index >= 0 and meat_index < meat_count then
+			meat = try_call(meat_array, "get_Item", meat_index)
+		end
+
+		if meat ~= nil then
+			for _, definition in ipairs(ELEMENT_DEFINITIONS) do
+				local value = as_number(read_member(meat, definition.field)) or 0
+				maximums[definition.type] = math.max(maximums[definition.type], value)
+			end
+		end
+	end
+
+	local weaknesses = {}
+	for _, definition in ipairs(ELEMENT_DEFINITIONS) do
+		local value = maximums[definition.type]
+		if value >= ELEMENT_WEAKNESS_THRESHOLD then
+			table.insert(weaknesses, { type = definition.type, value = value })
+		end
+	end
+
+	table.sort(weaknesses, function(left, right)
+		return left.value > right.value
+	end)
+	elemental_weakness_cache[em_id] = weaknesses
+	return weaknesses
+end
+
+local function try_read_elemental_weaknesses(enemy_context, em_id)
+	local ok, weaknesses = pcall(read_elemental_weaknesses, enemy_context, em_id)
+	if not ok then
+		diagnostics.last_error = "Elemental weakness read failed: " .. tostring(weaknesses)
+		return {}
+	end
+
+	return weaknesses
+end
+
 local function get_enemy_key(enemy)
 	local ok, address = pcall(function()
 		return enemy:get_address()
@@ -369,6 +475,7 @@ local function read_monster(enemy)
 	local is_weakened, capture_rate = read_enemy_dying(em)
 
 	return {
+		em_id = ids.id,
 		name = get_enemy_name(ids),
 		health = math.max(0, health),
 		max_health = max_health,
@@ -377,6 +484,7 @@ local function read_monster(enemy)
 		capture_rate = capture_rate,
 		is_finished = is_finished,
 		ailments = try_read_ailments(em),
+		elemental_weaknesses = try_read_elemental_weaknesses(em, ids.id),
 	}
 end
 
@@ -483,13 +591,25 @@ local function draw_fixed_percent(draw_list, x, y, color, ratio)
 	draw_outlined_text(draw_list, x + digit_width * 3 + decimal_width + digit_width, y, color, "%")
 end
 
+local function get_ailment_bar_height()
+	return math.max(8, math.floor(config.bar_height * 2 / 3))
+end
+
+local function get_ailment_height()
+	return 2 * get_ailment_bar_height() + 3
+end
+
+local function get_monster_height()
+	return config.font_size + 4 + config.bar_height + 4 + get_ailment_height()
+end
+
 local function draw_ailments(draw_list, x, y, ailments)
 	local ailments_by_order = {}
 	for _, ailment in ipairs(ailments or {}) do
 		ailments_by_order[ailment.order] = ailment
 	end
 
-	local bar_height = math.max(8, math.floor(config.bar_height * 2 / 3))
+	local bar_height = get_ailment_bar_height()
 	local bar_spacing = 3
 	local column_width = (config.bar_width - bar_spacing) / 2
 	for order, id in ipairs({ 5, 3, 7, 9 }) do
@@ -534,6 +654,108 @@ local function get_monster_rows()
 	return rows
 end
 
+local function load_d2d_image(path)
+	if d2d == nil or d2d.Image == nil then
+		return nil
+	end
+
+	local ok, image = pcall(d2d.Image.new, path)
+	return ok and image or nil
+end
+
+local function get_enemy_icon(em_id)
+	local name = enemy_id_names[em_id]
+	if name == nil then
+		return enemy_icon_unknown
+	end
+
+	if enemy_icon_cache[name] == nil then
+		local path = string.format("%s/tex_EmIcon_%s_IMLM4.tex.241106027.png", ENEMY_ICON_PATH, string.upper(name))
+		enemy_icon_cache[name] = load_d2d_image(path) or false
+	end
+
+	return enemy_icon_cache[name] or enemy_icon_unknown
+end
+
+local function draw_rounded_rect(x, y, width, height, radius, color)
+	d2d.fill_rect(x + radius, y, width - radius * 2, height, color)
+	d2d.fill_rect(x, y + radius, width, height - radius * 2, color)
+	d2d.fill_circle(x + radius, y + radius, radius, color)
+	d2d.fill_circle(x + width - radius, y + radius, radius, color)
+	d2d.fill_circle(x + radius, y + height - radius, radius, color)
+	d2d.fill_circle(x + width - radius, y + height - radius, radius, color)
+end
+
+local function draw_enemy_icons()
+	if not config.enabled or d2d == nil then
+		return
+	end
+
+	local rows = get_monster_rows()
+	if #rows == 0 then
+		return
+	end
+
+	local row_y = config.y
+	local row_height = 0
+	local monster_height = get_monster_height()
+	local icon_plate_size = monster_height
+	local enemy_icon_size = icon_plate_size - ENEMY_ICON_PADDING * 2
+
+	for index, monster in ipairs(rows) do
+		local column = (index - 1) % 2
+		local x = config.x
+			+ column * (icon_plate_size + ENEMY_ICON_BAR_SPACING + config.bar_width + config.column_spacing)
+		local icon = get_enemy_icon(monster.em_id)
+
+		draw_rounded_rect(x, row_y, icon_plate_size, icon_plate_size, ENEMY_ICON_CORNER_RADIUS, ENEMY_ICON_BORDER_COLOR)
+		draw_rounded_rect(
+			x + ENEMY_ICON_BORDER_WIDTH,
+			row_y + ENEMY_ICON_BORDER_WIDTH,
+			icon_plate_size - ENEMY_ICON_BORDER_WIDTH * 2,
+			icon_plate_size - ENEMY_ICON_BORDER_WIDTH * 2,
+			ENEMY_ICON_CORNER_RADIUS - ENEMY_ICON_BORDER_WIDTH,
+			ENEMY_ICON_BACKGROUND_COLOR
+		)
+		if icon ~= nil then
+			d2d.image(icon, x + ENEMY_ICON_PADDING, row_y + ENEMY_ICON_PADDING, enemy_icon_size, enemy_icon_size)
+		end
+
+		local weaknesses = monster.elemental_weaknesses or {}
+		local weakness_width = #weaknesses > 0
+				and config.weakness_icon_size + (#weaknesses - 1) * config.weakness_icon_spacing
+			or 0
+		local weakness_x = x + icon_plate_size - ENEMY_ICON_BORDER_WIDTH - weakness_width
+		local weakness_y = row_y + icon_plate_size - ENEMY_ICON_BORDER_WIDTH - config.weakness_icon_size
+		local maximum_weakness = weaknesses[1] and weaknesses[1].value or 0
+		local show_all_weaknesses = monster.name == "ゴグマジオス"
+		for weakness_index = #weaknesses, 1, -1 do
+			local weakness = weaknesses[weakness_index]
+			local element_icon = element_icons[weakness.type]
+			if element_icon ~= nil then
+				local alpha = config.weakness_icon_dim_alpha
+				if show_all_weaknesses or weakness.value == maximum_weakness then
+					alpha = 1.0
+				end
+				d2d.image(
+					element_icon,
+					weakness_x + (weakness_index - 1) * config.weakness_icon_spacing,
+					weakness_y,
+					config.weakness_icon_size,
+					config.weakness_icon_size,
+					alpha
+				)
+			end
+		end
+
+		row_height = math.max(row_height, monster_height)
+		if column == 1 or index == #rows then
+			row_y = row_y + row_height + config.row_spacing
+			row_height = 0
+		end
+	end
+end
+
 local function get_japanese_font(size)
 	if font_cache[size] == nil then
 		local ok, font = pcall(imgui.load_font, "NotoSansJP-Medium.otf", size)
@@ -566,9 +788,12 @@ local function draw_overlay()
 
 	local row_y = config.y
 	local row_height = 0
+	local icon_plate_size = get_monster_height()
 	for index, monster in ipairs(rows) do
 		local column = (index - 1) % 2
-		local x = config.x + column * (config.bar_width + config.column_spacing)
+		local item_x = config.x
+			+ column * (icon_plate_size + ENEMY_ICON_BAR_SPACING + config.bar_width + config.column_spacing)
+		local x = item_x + icon_plate_size + ENEMY_ICON_BAR_SPACING
 		local y = row_y
 		local text_x = x
 		local current_text = string.format("%5.0f", monster.health)
@@ -596,7 +821,7 @@ local function draw_overlay()
 		draw_bar(draw_list, x, y + config.font_size + 4, monster.ratio, monster.is_weakened, monster.capture_rate)
 		local ailment_height =
 			draw_ailments(draw_list, x, y + config.font_size + 4 + config.bar_height + 4, monster.ailments)
-		local monster_height = config.font_size + 4 + config.bar_height + 4 + ailment_height
+		local monster_height = math.max(icon_plate_size, config.font_size + 4 + config.bar_height + 4 + ailment_height)
 		row_height = math.max(row_height, monster_height)
 
 		if column == 1 or index == #rows then
@@ -635,6 +860,18 @@ re.on_draw_ui(function()
 		changed = changed or value_changed
 		value_changed, config.column_spacing = imgui.slider_int("Column spacing", config.column_spacing, 6, 24)
 		changed = changed or value_changed
+		value_changed, config.weakness_icon_size =
+			imgui.slider_int("Weakness icon size", config.weakness_icon_size, 8, 32)
+		changed = changed or value_changed
+		value_changed, config.weakness_icon_spacing =
+			imgui.slider_int("Weakness icon spacing", config.weakness_icon_spacing, 6, 20)
+		changed = changed or value_changed
+		local weakness_opacity_level = math.floor(config.weakness_icon_dim_alpha * 10 + 0.5)
+		value_changed, weakness_opacity_level = imgui.slider_int("Weakness icon opacity", weakness_opacity_level, 1, 10)
+		if value_changed then
+			config.weakness_icon_dim_alpha = weakness_opacity_level / 10
+			changed = true
+		end
 		if imgui.button("Reset values") then
 			config.x = DEFAULT_CONFIG.x
 			config.y = DEFAULT_CONFIG.y
@@ -643,6 +880,9 @@ re.on_draw_ui(function()
 			config.bar_height = DEFAULT_CONFIG.bar_height
 			config.row_spacing = DEFAULT_CONFIG.row_spacing
 			config.column_spacing = DEFAULT_CONFIG.column_spacing
+			config.weakness_icon_size = DEFAULT_CONFIG.weakness_icon_size
+			config.weakness_icon_spacing = DEFAULT_CONFIG.weakness_icon_spacing
+			config.weakness_icon_dim_alpha = DEFAULT_CONFIG.weakness_icon_dim_alpha
 			changed = true
 		end
 		imgui.separator()
@@ -656,6 +896,9 @@ re.on_draw_ui(function()
 
 		if changed then
 			config.font_size = math.max(10, config.font_size)
+			config.weakness_icon_size = math.max(8, math.min(32, config.weakness_icon_size))
+			config.weakness_icon_spacing = math.max(6, math.min(20, config.weakness_icon_spacing))
+			config.weakness_icon_dim_alpha = math.max(0.1, math.min(1.0, config.weakness_icon_dim_alpha))
 		end
 
 		imgui.tree_pop()
@@ -680,6 +923,15 @@ re.on_frame(function()
 	end
 	draw_overlay()
 end)
+
+if d2d ~= nil then
+	d2d.register(function()
+		enemy_icon_unknown = load_d2d_image(ENEMY_ICON_PATH .. "/tex_EmIcon_EM0000_00_0_IMLM4.tex.241106027.png")
+		for _, definition in ipairs(ELEMENT_DEFINITIONS) do
+			element_icons[definition.type] = load_d2d_image(ELEMENT_ICON_PATH .. "/" .. definition.icon)
+		end
+	end, draw_enemy_icons)
+end
 
 re.on_config_save(function()
 	save_config()
