@@ -17,16 +17,19 @@ local ENEMY_ICON_CORNER_RADIUS = 4
 local DEFAULT_CONFIG = {
 	enabled = true,
 	show_all = false,
+	show_severable_parts = true,
 	x = 600,
 	y = 12,
-	font_size = 20,
-	bar_width = 320,
-	bar_height = 12,
+	font_size = 18,
+	bar_width = 280,
+	bar_height = 8,
+	status_bar_height = 6,
 	row_spacing = 12,
 	column_spacing = 12,
-	weakness_icon_size = 16,
-	weakness_icon_spacing = 12,
-	weakness_icon_dim_alpha = 0.4,
+	weakness_icon_size = 24,
+	weakness_icon_spacing = 10,
+	weakness_icon_offset_x = -1,
+	weakness_icon_offset_y = -1,
 }
 
 local config = {}
@@ -62,6 +65,30 @@ local function get_enum_map(type_name)
 end
 
 local enemy_id_names = get_enum_map("app.EnemyDef.ID")
+local part_type_fixed_names = get_enum_map("app.EnemyDef.PARTS_TYPE_Fixed")
+
+local PART_TYPE_LABELS = {
+	FULL_BODY = "全身",
+	HEAD = "頭",
+	UPPER_BODY = "上半身",
+	BODY = "胴",
+	TAIL = "尻尾",
+	TAIL_TIP = "尻尾先端",
+	NECK = "首",
+	TORSO = "胴体",
+	STOMACH = "腹",
+	BACK = "背中",
+	FRONT_LEGS = "前脚",
+	LEFT_FRONT_LEG = "左前脚",
+	RIGHT_FRONT_LEG = "右前脚",
+	HIND_LEGS = "後脚",
+	LEFT_HIND_LEG = "左後脚",
+	RIGHT_HIND_LEG = "右後脚",
+	LEFT_WING = "左翼",
+	RIGHT_WING = "右翼",
+	TONGUE = "舌",
+	TENTACLE = "触手",
+}
 
 local AILMENT_DEFINITIONS = {
 	[3] = { name = "毒", order = 2, color = 0xFFF755A8, background_color = 0xAA54243D },
@@ -171,6 +198,22 @@ local function as_number(value)
 	end
 
 	return nil
+end
+
+local function is_severable_part_value_available()
+	local network_manager = sdk.get_managed_singleton("app.NetworkManager")
+	if network_manager == nil then
+		return true
+	end
+
+	local user_info_manager = read_member(network_manager, "UserInfoManager")
+	local host_user_info = try_call(user_info_manager, "getHostUserInfo(app.net_session_manager.SESSION_TYPE)", 2)
+	if host_user_info == nil then
+		return true
+	end
+
+	local is_self = read_member(host_user_info, "IsSelf")
+	return is_self ~= false
 end
 
 local function read_ailments(enemy_context)
@@ -339,6 +382,68 @@ local function try_read_elemental_weaknesses(enemy_context, em_id)
 	return weaknesses
 end
 
+local function read_severable_parts(enemy_context)
+	local parts_module = read_member(enemy_context, "Parts")
+	local damage_parts = read_member(parts_module, "_DmgParts")
+	local break_parts = read_member(parts_module, "_BreakParts")
+	local parameters = read_member(parts_module, "_ParamParts")
+	local link_parts = read_member(parameters, "_LinkPartsIndexByBreakParts")
+	local part_parameters = read_member(read_member(parameters, "_PartsArray"), "_DataArray")
+	if damage_parts == nil or break_parts == nil or link_parts == nil or part_parameters == nil then
+		return {}
+	end
+
+	local severable_parts = {}
+	local seen_indices = {}
+	local value_available = is_severable_part_value_available()
+	local break_count = try_call(break_parts, "get_Count") or 0
+	for break_index = 0, break_count - 1 do
+		local break_part = try_call(break_parts, "get_Item", break_index)
+		if break_part ~= nil and try_call(break_part, "get_IsLostParts") == true then
+			local linked_indices = try_call(link_parts, "get_Item", break_index)
+			local linked_count = try_call(linked_indices, "get_Count") or 0
+			for linked_index = 0, linked_count - 1 do
+				local part_index = as_number(try_call(linked_indices, "get_Item", linked_index))
+				if part_index ~= nil and not seen_indices[part_index] then
+					seen_indices[part_index] = true
+					local damage_part = try_call(damage_parts, "get_Item", part_index)
+					local current = as_number(try_call(damage_part, "get_Value()"))
+					local maximum = as_number(try_call(damage_part, "get_DefaultValue()"))
+					local has_value = current ~= nil and maximum ~= nil and maximum > 0
+					local is_broken = try_call(break_part, "get_IsBreak") == true
+					local part_parameter = try_call(part_parameters, "get_Item", part_index)
+					local fixed_type = as_number(read_member(read_member(part_parameter, "_PartsType"), "_Value"))
+					local type_name = fixed_type ~= nil and part_type_fixed_names[fixed_type] or nil
+					table.insert(severable_parts, {
+						index = part_index,
+						name = PART_TYPE_LABELS[type_name] or type_name,
+						ratio = is_broken and 0 or (has_value and math.max(0, math.min(1, current / maximum)) or 1),
+						value_available = value_available and has_value,
+					})
+				end
+			end
+		end
+	end
+
+	table.sort(severable_parts, function(left, right)
+		return left.index < right.index
+	end)
+	for index, part in ipairs(severable_parts) do
+		part.name = part.name or "切断 " .. tostring(index)
+	end
+	return severable_parts
+end
+
+local function try_read_severable_parts(enemy_context)
+	local ok, severable_parts = pcall(read_severable_parts, enemy_context)
+	if not ok then
+		diagnostics.last_error = "Severable part read failed: " .. tostring(severable_parts)
+		return {}
+	end
+
+	return severable_parts
+end
+
 local function get_enemy_key(enemy)
 	local ok, address = pcall(function()
 		return enemy:get_address()
@@ -484,6 +589,7 @@ local function read_monster(enemy)
 		capture_rate = capture_rate,
 		is_finished = is_finished,
 		ailments = try_read_ailments(em),
+		severable_parts = try_read_severable_parts(em),
 		elemental_weaknesses = try_read_elemental_weaknesses(em, ids.id),
 	}
 end
@@ -591,16 +697,25 @@ local function draw_fixed_percent(draw_list, x, y, color, ratio)
 	draw_outlined_text(draw_list, x + digit_width * 3 + decimal_width + digit_width, y, color, "%")
 end
 
-local function get_ailment_bar_height()
-	return math.max(8, math.floor(config.bar_height * 2 / 3))
+local function get_status_bar_height()
+	return config.status_bar_height
 end
 
 local function get_ailment_height()
-	return 2 * get_ailment_bar_height() + 3
+	return 2 * get_status_bar_height() + 3
+end
+
+local function get_severable_part_height()
+	if not config.show_severable_parts then
+		return 0
+	end
+
+	local row_height = math.max(10, math.floor(config.font_size * 0.65), get_status_bar_height())
+	return 4 + row_height
 end
 
 local function get_monster_height()
-	return config.font_size + 4 + config.bar_height + 4 + get_ailment_height()
+	return config.font_size + 4 + config.bar_height + 4 + get_ailment_height() + get_severable_part_height()
 end
 
 local function draw_ailments(draw_list, x, y, ailments)
@@ -609,7 +724,7 @@ local function draw_ailments(draw_list, x, y, ailments)
 		ailments_by_order[ailment.order] = ailment
 	end
 
-	local bar_height = get_ailment_bar_height()
+	local bar_height = get_status_bar_height()
 	local bar_spacing = 3
 	local column_width = (config.bar_width - bar_spacing) / 2
 	for order, id in ipairs({ 5, 3, 7, 9 }) do
@@ -639,6 +754,57 @@ local function draw_ailments(draw_list, x, y, ailments)
 	end
 
 	return 2 * bar_height + bar_spacing
+end
+
+local get_japanese_font
+
+local function draw_severable_parts(draw_list, x, y, severable_parts)
+	if not config.show_severable_parts then
+		return 0
+	end
+
+	local font_size = math.max(10, math.floor(config.font_size * 0.65))
+	local bar_height = get_status_bar_height()
+	local row_height = math.max(font_size, bar_height)
+	if #severable_parts == 0 then
+		return row_height
+	end
+
+	local font = get_japanese_font(font_size)
+	if font ~= nil then
+		imgui.push_font(font)
+	else
+		imgui.push_font_size(font_size)
+	end
+
+	local column_spacing = 6
+	local column_width = (config.bar_width - (#severable_parts - 1) * column_spacing) / #severable_parts
+	for index, part in ipairs(severable_parts) do
+		local column_x = x + (index - 1) * (column_width + column_spacing)
+		local label_width = get_text_width(part.name)
+		local bar_x = column_x + label_width + 5
+		local bar_width = math.max(1, column_width - label_width - 5)
+		local label_color = part.value_available and 0xFFE8E8E8 or 0xFF888888
+		local fill_color = part.value_available and 0xFF3C8DFF or 0xFF777777
+		draw_outlined_text(draw_list, column_x, y, label_color, part.name)
+		draw_capsule_bar(
+			draw_list,
+			bar_x,
+			y + (row_height - bar_height) / 2,
+			bar_width,
+			bar_height,
+			part.ratio,
+			0xAA2B2926,
+			fill_color
+		)
+	end
+
+	if font ~= nil then
+		imgui.pop_font()
+	else
+		imgui.pop_font_size()
+	end
+	return row_height
 end
 
 local function get_monster_rows()
@@ -722,28 +888,51 @@ local function draw_enemy_icons()
 		end
 
 		local weaknesses = monster.elemental_weaknesses or {}
-		local weakness_width = #weaknesses > 0
-				and config.weakness_icon_size + (#weaknesses - 1) * config.weakness_icon_spacing
-			or 0
-		local weakness_x = x + icon_plate_size - ENEMY_ICON_BORDER_WIDTH - weakness_width
-		local weakness_y = row_y + icon_plate_size - ENEMY_ICON_BORDER_WIDTH - config.weakness_icon_size
+		local weakness_y = row_y
+			+ icon_plate_size
+			- ENEMY_ICON_BORDER_WIDTH
+			- config.weakness_icon_size
+			+ config.weakness_icon_offset_y
 		local maximum_weakness = weaknesses[1] and weaknesses[1].value or 0
-		local show_all_weaknesses = monster.name == "ゴグマジオス"
-		for weakness_index = #weaknesses, 1, -1 do
-			local weakness = weaknesses[weakness_index]
+		local strongest_weaknesses = {}
+		local other_weaknesses = {}
+		for _, weakness in ipairs(weaknesses) do
+			if weakness.value == maximum_weakness then
+				table.insert(strongest_weaknesses, weakness)
+			else
+				table.insert(other_weaknesses, weakness)
+			end
+		end
+
+		local strongest_x = x + ENEMY_ICON_BORDER_WIDTH + config.weakness_icon_offset_x
+		for weakness_index = #strongest_weaknesses, 1, -1 do
+			local weakness = strongest_weaknesses[weakness_index]
 			local element_icon = element_icons[weakness.type]
 			if element_icon ~= nil then
-				local alpha = config.weakness_icon_dim_alpha
-				if show_all_weaknesses or weakness.value == maximum_weakness then
-					alpha = 1.0
-				end
 				d2d.image(
 					element_icon,
-					weakness_x + (weakness_index - 1) * config.weakness_icon_spacing,
+					strongest_x + (weakness_index - 1) * config.weakness_icon_spacing,
 					weakness_y,
 					config.weakness_icon_size,
+					config.weakness_icon_size
+				)
+			end
+		end
+
+		local other_width = #other_weaknesses > 0
+				and config.weakness_icon_size + (#other_weaknesses - 1) * config.weakness_icon_spacing
+			or 0
+		local other_x = x + icon_plate_size - ENEMY_ICON_BORDER_WIDTH - other_width + config.weakness_icon_offset_x
+		for weakness_index = #other_weaknesses, 1, -1 do
+			local weakness = other_weaknesses[weakness_index]
+			local element_icon = element_icons[weakness.type]
+			if element_icon ~= nil then
+				d2d.image(
+					element_icon,
+					other_x + (weakness_index - 1) * config.weakness_icon_spacing,
+					weakness_y,
 					config.weakness_icon_size,
-					alpha
+					config.weakness_icon_size
 				)
 			end
 		end
@@ -756,7 +945,7 @@ local function draw_enemy_icons()
 	end
 end
 
-local function get_japanese_font(size)
+get_japanese_font = function(size)
 	if font_cache[size] == nil then
 		local ok, font = pcall(imgui.load_font, "NotoSansJP-Medium.otf", size)
 		font_cache[size] = ok and font or false
@@ -821,7 +1010,22 @@ local function draw_overlay()
 		draw_bar(draw_list, x, y + config.font_size + 4, monster.ratio, monster.is_weakened, monster.capture_rate)
 		local ailment_height =
 			draw_ailments(draw_list, x, y + config.font_size + 4 + config.bar_height + 4, monster.ailments)
-		local monster_height = math.max(icon_plate_size, config.font_size + 4 + config.bar_height + 4 + ailment_height)
+		local severable_height = draw_severable_parts(
+			draw_list,
+			x,
+			y + config.font_size + 4 + config.bar_height + 4 + ailment_height + 4,
+			monster.severable_parts or {}
+		)
+		local monster_height = math.max(
+			icon_plate_size,
+			config.font_size
+				+ 4
+				+ config.bar_height
+				+ 4
+				+ ailment_height
+				+ (config.show_severable_parts and 4 or 0)
+				+ severable_height
+		)
 		row_height = math.max(row_height, monster_height)
 
 		if column == 1 or index == #rows then
@@ -846,6 +1050,8 @@ re.on_draw_ui(function()
 		changed = changed or value_changed
 		value_changed, config.show_all = imgui.checkbox("Show all", config.show_all)
 		changed = changed or value_changed
+		value_changed, config.show_severable_parts = imgui.checkbox("Show severable parts", config.show_severable_parts)
+		changed = changed or value_changed
 		value_changed, config.x = imgui.slider_int("X", config.x, 0, 1920)
 		changed = changed or value_changed
 		value_changed, config.y = imgui.slider_int("Y", config.y, 0, 1080)
@@ -855,6 +1061,9 @@ re.on_draw_ui(function()
 		value_changed, config.bar_width = imgui.slider_int("Bar width", config.bar_width, 160, 640)
 		changed = changed or value_changed
 		value_changed, config.bar_height = imgui.slider_int("Bar height", config.bar_height, 6, 24)
+		changed = changed or value_changed
+		value_changed, config.status_bar_height =
+			imgui.slider_int("Status/sever bar height", config.status_bar_height, 4, 20)
 		changed = changed or value_changed
 		value_changed, config.row_spacing = imgui.slider_int("Row spacing", config.row_spacing, 6, 24)
 		changed = changed or value_changed
@@ -866,23 +1075,25 @@ re.on_draw_ui(function()
 		value_changed, config.weakness_icon_spacing =
 			imgui.slider_int("Weakness icon spacing", config.weakness_icon_spacing, 6, 20)
 		changed = changed or value_changed
-		local weakness_opacity_level = math.floor(config.weakness_icon_dim_alpha * 10 + 0.5)
-		value_changed, weakness_opacity_level = imgui.slider_int("Weakness icon opacity", weakness_opacity_level, 1, 10)
-		if value_changed then
-			config.weakness_icon_dim_alpha = weakness_opacity_level / 10
-			changed = true
-		end
+		value_changed, config.weakness_icon_offset_x =
+			imgui.slider_int("Weakness icon X offset", config.weakness_icon_offset_x, -64, 64)
+		changed = changed or value_changed
+		value_changed, config.weakness_icon_offset_y =
+			imgui.slider_int("Weakness icon Y offset", config.weakness_icon_offset_y, -64, 64)
+		changed = changed or value_changed
 		if imgui.button("Reset values") then
 			config.x = DEFAULT_CONFIG.x
 			config.y = DEFAULT_CONFIG.y
 			config.font_size = DEFAULT_CONFIG.font_size
 			config.bar_width = DEFAULT_CONFIG.bar_width
 			config.bar_height = DEFAULT_CONFIG.bar_height
+			config.status_bar_height = DEFAULT_CONFIG.status_bar_height
 			config.row_spacing = DEFAULT_CONFIG.row_spacing
 			config.column_spacing = DEFAULT_CONFIG.column_spacing
 			config.weakness_icon_size = DEFAULT_CONFIG.weakness_icon_size
 			config.weakness_icon_spacing = DEFAULT_CONFIG.weakness_icon_spacing
-			config.weakness_icon_dim_alpha = DEFAULT_CONFIG.weakness_icon_dim_alpha
+			config.weakness_icon_offset_x = DEFAULT_CONFIG.weakness_icon_offset_x
+			config.weakness_icon_offset_y = DEFAULT_CONFIG.weakness_icon_offset_y
 			changed = true
 		end
 		imgui.separator()
@@ -896,9 +1107,11 @@ re.on_draw_ui(function()
 
 		if changed then
 			config.font_size = math.max(10, config.font_size)
+			config.status_bar_height = math.max(4, math.min(20, config.status_bar_height))
 			config.weakness_icon_size = math.max(8, math.min(32, config.weakness_icon_size))
 			config.weakness_icon_spacing = math.max(6, math.min(20, config.weakness_icon_spacing))
-			config.weakness_icon_dim_alpha = math.max(0.1, math.min(1.0, config.weakness_icon_dim_alpha))
+			config.weakness_icon_offset_x = math.max(-64, math.min(64, config.weakness_icon_offset_x))
+			config.weakness_icon_offset_y = math.max(-64, math.min(64, config.weakness_icon_offset_y))
 		end
 
 		imgui.tree_pop()
