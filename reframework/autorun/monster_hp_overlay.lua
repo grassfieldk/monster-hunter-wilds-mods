@@ -295,6 +295,72 @@ local function try_read_ailments(enemy_context)
 	return ailments
 end
 
+local function read_stamina_and_anger(enemy_context)
+	local result = {
+		stamina = { ratio = 1, available = false },
+		anger = { ratio = 1, available = false },
+	}
+	if enemy_context_conditions == nil or conditions_module_conditions == nil then
+		return result
+	end
+
+	local conditions_module = enemy_context_conditions:get_data(enemy_context)
+	local conditions = conditions_module and conditions_module_conditions:get_data(conditions_module) or nil
+	if conditions == nil then
+		return result
+	end
+
+	local count = try_call(conditions, "get_Count") or 0
+	for index = 0, count - 1 do
+		local condition = try_call(conditions, "get_Item", index)
+		local type_definition = condition and condition:get_type_definition() or nil
+		local type_name = type_definition and type_definition:get_name() or nil
+		local target
+		if type_name == "cEnemyTiredCondition" then
+			target = result.stamina
+		elseif type_name == "cEnemyAngryCondition" then
+			target = result.anger
+		end
+
+		if target ~= nil then
+			local is_active = try_call(condition, "get_IsActive()") == true
+			local current
+			local maximum
+			if is_active then
+				maximum = as_number(try_call(condition, "get_ActivateTime()"))
+				local current_timer = as_number(try_call(condition, "get_CurrentTimer()"))
+				current = maximum ~= nil and current_timer ~= nil and maximum - current_timer or nil
+			elseif type_name == "cEnemyTiredCondition" then
+				current = as_number(try_call(condition, "get_Stamina()"))
+				maximum = as_number(try_call(condition, "get_DefaultStamina()"))
+			else
+				current = as_number(try_call(condition, "get_Value()"))
+				maximum = as_number(try_call(condition, "get_LimitValue()"))
+			end
+
+			if current ~= nil and maximum ~= nil and maximum > 0 then
+				target.ratio = math.max(0, math.min(1, current / maximum))
+				target.available = true
+			end
+		end
+	end
+
+	return result
+end
+
+local function try_read_stamina_and_anger(enemy_context)
+	local ok, result = pcall(read_stamina_and_anger, enemy_context)
+	if not ok then
+		diagnostics.last_error = "Stamina/anger read failed: " .. tostring(result)
+		return {
+			stamina = { ratio = 1, available = false },
+			anger = { ratio = 1, available = false },
+		}
+	end
+
+	return result
+end
+
 local function read_enemy_dying(enemy_context)
 	if enemy_context_dying == nil then
 		return false, nil
@@ -600,6 +666,7 @@ local function read_monster(enemy)
 		is_weakened = is_weakened,
 		capture_rate = capture_rate,
 		is_finished = is_finished,
+		stamina_and_anger = try_read_stamina_and_anger(em),
 		ailments = try_read_ailments(em),
 		severable_parts = try_read_severable_parts(em),
 		elemental_weaknesses = try_read_elemental_weaknesses(em, ids.id),
@@ -637,12 +704,20 @@ local function draw_capsule_bar(draw_list, x, y, width, height, ratio, backgroun
 	end
 end
 
-local function draw_bar(draw_list, x, y, ratio, is_weakened, capture_rate)
+local function draw_grouped_primary_bars(draw_list, x, y, ratio, is_weakened, capture_rate, states)
 	local background_color = 0xAA222222
 	local green_color = 0xFF38B764
 	local yellow_color = 0xFF32A8E0
 	local red_color = 0xFF3C55D9
 	local fill_color = green_color
+	local status_height = config.status_bar_height
+	local total_height = config.bar_height + status_height
+	local half_width = config.bar_width / 2
+	local bottom_y = y + config.bar_height
+	local radius = math.max(1, math.min(4, config.bar_height / 2, status_height / 2))
+	local border_color = 0x88000000
+	local stamina = states and states.stamina or nil
+	local anger = states and states.anger or nil
 
 	if is_weakened then
 		fill_color = red_color
@@ -650,7 +725,53 @@ local function draw_bar(draw_list, x, y, ratio, is_weakened, capture_rate)
 		fill_color = yellow_color
 	end
 
-	draw_capsule_bar(draw_list, x, y, config.bar_width, config.bar_height, ratio, background_color, fill_color)
+	draw_list:add_rect_filled({ x, y }, { x + config.bar_width, y + total_height }, background_color, radius, 0)
+	draw_list:add_rect_filled({ x, bottom_y }, { x + half_width, y + total_height }, 0xAA3A3825, radius, 64)
+	draw_list:add_rect_filled(
+		{ x + half_width, bottom_y },
+		{ x + config.bar_width, y + total_height },
+		0xAA2E2424,
+		radius,
+		128
+	)
+
+	local hp_fill_width = config.bar_width * math.max(0, math.min(1, ratio))
+	if hp_fill_width > 0 then
+		local rounding_flags = hp_fill_width >= config.bar_width and 48 or 16
+		draw_list:add_rect_filled(
+			{ x, y },
+			{ x + hp_fill_width, y + config.bar_height },
+			fill_color,
+			radius,
+			rounding_flags
+		)
+	end
+
+	local stamina_ratio = stamina and stamina.ratio or 1
+	local stamina_width = half_width * math.max(0, math.min(1, stamina_ratio))
+	if stamina_width > 0 then
+		draw_list:add_rect_filled(
+			{ x, bottom_y },
+			{ x + stamina_width, y + total_height },
+			stamina and stamina.available and 0xFF35D5F3 or 0xFF155561,
+			radius,
+			64
+		)
+	end
+
+	local anger_ratio = anger and anger.ratio or 1
+	local anger_width = half_width * math.max(0, math.min(1, anger_ratio))
+	if anger_width > 0 then
+		local rounding_flags = anger_width >= half_width and 128 or 0
+		draw_list:add_rect_filled(
+			{ x + half_width, bottom_y },
+			{ x + half_width + anger_width, y + total_height },
+			anger and anger.available and 0xFF3C55D9 or 0xFF182257,
+			radius,
+			rounding_flags
+		)
+	end
+
 	local bottom = y + config.bar_height
 	local half_marker_x = x + config.bar_width * 0.5
 	draw_list:add_rect_filled({ half_marker_x, y + 1 }, { half_marker_x + 1, bottom - 1 }, yellow_color, 0, 0)
@@ -659,6 +780,18 @@ local function draw_bar(draw_list, x, y, ratio, is_weakened, capture_rate)
 		local weakened_marker_x = x + config.bar_width * capture_rate
 		draw_list:add_rect_filled({ weakened_marker_x, y + 1 }, { weakened_marker_x + 1, bottom - 1 }, red_color, 0, 0)
 	end
+
+	draw_list:add_rect_filled({ x + 1, bottom_y }, { x + config.bar_width - 1, bottom_y + 1 }, border_color, 0, 0)
+	draw_list:add_rect_filled(
+		{ x + half_width, bottom_y + 1 },
+		{ x + half_width + 1, y + total_height - 1 },
+		border_color,
+		0,
+		0
+	)
+	draw_list:add_rect({ x, y }, { x + config.bar_width, y + total_height }, border_color, radius, 0, 1)
+
+	return status_height
 end
 
 local function draw_outlined_text(draw_list, x, y, color, text)
@@ -717,6 +850,10 @@ local function get_ailment_height()
 	return 2 * get_status_bar_height() + 3
 end
 
+local function get_stamina_and_anger_height()
+	return get_status_bar_height()
+end
+
 local function get_severable_part_height()
 	if not config.show_severable_parts then
 		return 0
@@ -727,7 +864,13 @@ local function get_severable_part_height()
 end
 
 local function get_monster_height()
-	return config.font_size + 4 + config.bar_height + 4 + get_ailment_height() + get_severable_part_height()
+	return config.font_size
+		+ 4
+		+ config.bar_height
+		+ get_stamina_and_anger_height()
+		+ 4
+		+ get_ailment_height()
+		+ get_severable_part_height()
 end
 
 local function draw_ailments(draw_list, x, y, ailments)
@@ -796,8 +939,8 @@ local function draw_severable_parts(draw_list, x, y, severable_parts)
 		local label_width = get_text_width(part.name)
 		local bar_x = column_x + label_width + 5
 		local bar_width = math.max(1, column_width - label_width - 5)
-		local label_color = part.value_available and 0xFFE8E8E8 or 0xFF888888
-		local fill_color = part.value_available and 0xFF3C8DFF or 0xFF777777
+		local label_color = part.value_available and 0xFFE8E8E8 or 0xFFAAAAAA
+		local fill_color = part.value_available and 0xFF3C8DFF or 0xFF183866
 		draw_outlined_text(draw_list, column_x, y, label_color, part.name)
 		draw_capsule_bar(
 			draw_list,
@@ -1019,13 +1162,22 @@ local function draw_overlay()
 		draw_outlined_text(draw_list, slash_x, y, value_color, "/")
 		draw_outlined_text(draw_list, max_x, y, value_color, max_text)
 		draw_fixed_percent(draw_list, percent_x, y, value_color, monster.ratio)
-		draw_bar(draw_list, x, y + config.font_size + 4, monster.ratio, monster.is_weakened, monster.capture_rate)
+		local hp_bar_y = y + config.font_size + 4
+		local stamina_and_anger_height = draw_grouped_primary_bars(
+			draw_list,
+			x,
+			hp_bar_y,
+			monster.ratio,
+			monster.is_weakened,
+			monster.capture_rate,
+			monster.stamina_and_anger
+		)
 		local ailment_height =
-			draw_ailments(draw_list, x, y + config.font_size + 4 + config.bar_height + 4, monster.ailments)
+			draw_ailments(draw_list, x, hp_bar_y + config.bar_height + stamina_and_anger_height + 4, monster.ailments)
 		local severable_height = draw_severable_parts(
 			draw_list,
 			x,
-			y + config.font_size + 4 + config.bar_height + 4 + ailment_height + 4,
+			hp_bar_y + config.bar_height + stamina_and_anger_height + 4 + ailment_height + 4,
 			monster.severable_parts or {}
 		)
 		local monster_height = math.max(
@@ -1033,6 +1185,7 @@ local function draw_overlay()
 			config.font_size
 				+ 4
 				+ config.bar_height
+				+ stamina_and_anger_height
 				+ 4
 				+ ailment_height
 				+ (config.show_severable_parts and 4 or 0)
