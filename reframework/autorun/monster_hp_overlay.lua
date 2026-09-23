@@ -456,6 +456,18 @@ local function get_enemy_key(enemy)
 	return tostring(enemy)
 end
 
+local function is_quest_target(enemy, browser)
+	local access_key = try_call(browser, "get_ThisTargetAccessKey")
+	local mission_manager = sdk.get_managed_singleton("app.MissionManager")
+	local quest_director = try_call(mission_manager, "get_QuestDirector")
+	local result = try_call(quest_director, "isQuestTarget(app.TARGET_ACCESS_KEY)", access_key)
+	if result ~= nil then
+		return result == true
+	end
+
+	return quest_target_keys[get_enemy_key(enemy)] == true
+end
+
 local function refresh_quest_targets()
 	quest_target_keys = {}
 	if get_active_quest_target_bosses == nil or get_enemy_character == nil then
@@ -517,13 +529,13 @@ end
 
 local function get_enemy_name(ids)
 	if ids == nil or ids.id == nil then
-		return "Large Monster"
+		return "Monster"
 	end
 
 	local enemy_def = sdk.find_type_definition("app.EnemyDef")
 	local name_method = enemy_def and enemy_def:get_method("NameString")
 	if name_method == nil then
-		return "Large Monster " .. tostring(ids.id)
+		return "Monster " .. tostring(ids.id)
 	end
 
 	local ok, name = pcall(function()
@@ -534,7 +546,7 @@ local function get_enemy_name(ids)
 		return normalize_enemy_name(name)
 	end
 
-	return "Large Monster " .. tostring(ids.id)
+	return "Monster " .. tostring(ids.id)
 end
 
 local function read_monster(enemy)
@@ -549,15 +561,15 @@ local function read_monster(enemy)
 		return nil
 	end
 
-	local is_boss = read_member(basic, "IsBoss")
-	if is_boss ~= true then
+	local browser = read_member(em, "Browser")
+	local quest_target = is_quest_target(enemy, browser)
+	local is_boss = read_member(basic, "IsBoss") == true
+	if not is_boss and not quest_target then
 		return nil
 	end
 
-	local browser = read_member(em, "Browser")
-	local is_quest_target = quest_target_keys[get_enemy_key(enemy)] == true
 	local is_combat = try_call(browser, "get_IsCombatPl") == true
-	if not config.show_all and not is_quest_target and not is_combat then
+	if not config.show_all and not quest_target and not is_combat then
 		return nil
 	end
 
@@ -1098,7 +1110,7 @@ re.on_draw_ui(function()
 		end
 		imgui.separator()
 		imgui.text("Update callbacks: " .. tostring(diagnostics.update_calls))
-		imgui.text("Large monster candidates: " .. tostring(diagnostics.boss_candidates))
+		imgui.text("Monster candidates: " .. tostring(diagnostics.boss_candidates))
 		imgui.text("Tracked monsters: " .. tostring(#get_monster_rows()))
 		imgui.text("Ailment entries: " .. tostring(diagnostics.ailment_count))
 		if diagnostics.last_error ~= nil then
